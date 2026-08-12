@@ -110,8 +110,8 @@ def fetch_lyric(song_id):
         return None
 
 
-def fetch_cover(song_id, album_id, size=500):
-    """经专辑 API 拿封面 URL 并下载图片字节。搜索 API 的 album 字段无 picUrl。"""
+def fetch_cover_netease(song_id, album_id, size=500):
+    """主源：网易云专辑 API。搜索 API 的 album 字段无 picUrl，须经 album.id 调专辑 API。"""
     try:
         if album_id:
             data = http_get_json(f"{API_ALBUM}/{album_id}")
@@ -124,7 +124,78 @@ def fetch_cover(song_id, album_id, size=500):
     return None
 
 
-def write_id3(mp3_path, title, artist, album, cover_bytes):
+def fetch_cover_deezer(artist, title, size="cover_big"):
+    """备源：Deezer 公开搜索 API（免 key），按「歌手 歌名」搜专辑封面。"""
+    try:
+        q = urllib.parse.quote(f'{artist} "{title}"')
+        data = http_get_json(
+            f"https://api.deezer.com/search?q={q}&limit=3", timeout=10)
+        for r in data.get("data", []) or []:
+            url = (r.get("album") or {}).get(size) or ""
+            if url:
+                return http_get(url, timeout=15)
+    except Exception:
+        pass
+    return None
+
+
+def fetch_cover(song_id, album_id, artist, title):
+    """封面多源链：网易云专辑 → Deezer → None。"""
+    cover = fetch_cover_netease(song_id, album_id)
+    if cover:
+        return cover, "jpeg"
+    cover = fetch_cover_deezer(artist, title)
+    if cover:
+        return cover, "jpeg"
+    return None, None
+
+
+def make_placeholder_png(size=500, seed="cover"):
+    """兜底：纯标准库生成渐变色 PNG（无文字渲染依赖）。"""
+    import struct
+    import zlib
+
+    def _hsl(h, s, l):
+        c = (1 - abs(2 * l - 1)) * s
+        x = c * (1 - abs((h / 60) % 2 - 1))
+        m = l - c / 2
+        if h < 60:
+            r, g, b = c, x, 0
+        elif h < 120:
+            r, g, b = x, c, 0
+        elif h < 180:
+            r, g, b = 0, c, x
+        elif h < 240:
+            r, g, b = 0, x, c
+        elif h < 300:
+            r, g, b = x, 0, c
+        else:
+            r, g, b = c, 0, x
+        return int((r + m) * 255), int((g + m) * 255), int((b + m) * 255)
+
+    h1 = sum(seed.encode("utf-8", "replace")) * 37 % 360
+    h2 = (h1 + 80) % 360
+    rows = bytearray()
+    for y in range(size):
+        t = y / max(size - 1, 1)
+        r1, g1, b1 = _hsl(h1, 0.55, 0.40)
+        r2, g2, b2 = _hsl(h2, 0.55, 0.40)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        rows += b"\x00" + bytes((r, g, b)) * size
+
+    def chunk(tag, data):
+        return (tag + struct.pack(">I", len(data)) + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(rows), 6))
+            + chunk(b"IEND", b""))
+
+
+def write_id3(mp3_path, title, artist, album, cover_bytes, cover_mime="jpeg"):
     """用 mutagen 写入 ID3 标签。"""
     try:
         from mutagen.id3 import APIC, TALB, TIT2, TPE1, ID3
@@ -145,7 +216,8 @@ def write_id3(mp3_path, title, artist, album, cover_bytes):
     if album:
         tags.add(TALB(encoding=3, text=album))
     if cover_bytes:
-        tags.add(APIC(encoding=3, mime="image/jpeg", type=3,
+        mime = "image/png" if cover_mime == "png" else "image/jpeg"
+        tags.add(APIC(encoding=3, mime=mime, type=3,
                       desc="Cover", data=cover_bytes))
     tags.save(str(mp3_path))
     return True
@@ -163,6 +235,46 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose)
         candidates = songs
     candidates.sort(key=lambda s: -(s.get("score") or 0))
 
+    # 优先找「音频+封面」都齐的候选；封面失败不锁定音频，继续换下一个版本
+    best = None  # (song, data) 音频成功但封面未齐的第一个候选，作兜底
+
+    def _finalize(song, data, cover, cover_mime):
+        """写文件 + 歌词 + ID3，返回汇报消息。"""
+        sid = song["id"]
+        name = song.get("name", "")
+        artist = song_artist(song)
+        dur = song.get("duration", 0) / 1000
+        album = (song.get("album") or {}).get("name", "")
+
+        fname = sanitize(f"{artist or '未知艺术家'} - {name or '未知歌曲'}")
+        mp3_path = Path(out_dir) / f"{fname}.mp3"
+        # 中文路径安全：先落临时英文名再改名（Windows + 部分 curl 环境）
+        tmp_path = mp3_path.with_suffix(".tmp.mp3")
+        tmp_path.write_bytes(data)
+        tmp_path.replace(mp3_path)
+
+        notes = []
+        if with_lyric:
+            lrc = fetch_lyric(sid)
+            if lrc:
+                (Path(out_dir) / f"{fname}.lrc").write_text(lrc, encoding="utf-8")
+                notes.append("歌词")
+        if with_cover:
+            write_id3(mp3_path, name, artist, album, cover, cover_mime)
+            if cover_mime == "png":
+                notes.append("占位封面")
+            elif cover:
+                notes.append("封面")
+            else:
+                notes.append("标签")
+        else:
+            write_id3(mp3_path, name, artist, album, None)
+            notes.append("标签")
+
+        size_mb = os.path.getsize(mp3_path) / 1048576
+        return (f"{name} - {artist}  {size_mb:.1f}MB  "
+                f"({dur:.0f}s) [{'/'.join(notes) or '无'}]")
+
     for song in candidates:
         sid = song["id"]
         name = song.get("name", "")
@@ -176,39 +288,31 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose)
         if not ok:
             continue
 
-        album = (song.get("album") or {}).get("name", "")
-        album_id = (song.get("album") or {}).get("id")
+        if best is None:
+            best = (song, data)
 
-        # 用候选自身的名字（已在搜索阶段过滤过关键词），保证和 lrc 同名
-        fname = sanitize(f"{artist or '未知艺术家'} - {name or '未知歌曲'}")
-        mp3_path = Path(out_dir) / f"{fname}.mp3"
+        if not with_cover:
+            return True, _finalize(song, data, None, None)
 
-        # 中文路径安全：先落临时英文名再改名（Windows + 部分 curl 环境）
-        tmp_path = mp3_path.with_suffix(".tmp.mp3")
-        tmp_path.write_bytes(data)
-        tmp_path.replace(mp3_path)
+        cover, mime = fetch_cover(sid, (song.get("album") or {}).get("id"),
+                                  artist, name)
+        if cover:
+            return True, _finalize(song, data, cover, mime)
+        # 封面失败 → 换下一个候选版本（可能专辑带图）
+        if verbose:
+            print(f"  - {name} 无封面，继续换候选…")
 
-        notes = []
-        if with_lyric:
-            lrc = fetch_lyric(sid)
-            if lrc:
-                (Path(out_dir) / f"{fname}.lrc").write_text(lrc, encoding="utf-8")
-                notes.append("歌词")
+    # 所有候选都没有封面：用第一首音频成功的，走 Deezer 备源 + 占位图兜底
+    if best:
+        song, data = best
+        cover = mime = None
         if with_cover:
-            cover = fetch_cover(sid, album_id)
-            if cover:
-                write_id3(mp3_path, name, artist, album, cover)
-                notes.append("封面")
-            else:
-                write_id3(mp3_path, name, artist, album, None)
-                notes.append("标签")
-        else:
-            write_id3(mp3_path, name, artist, album, None)
-            notes.append("标签")
-
-        size_mb = os.path.getsize(mp3_path) / 1048576
-        return True, (f"{name} - {artist}  {size_mb:.1f}MB  "
-                      f"({dur:.0f}s) [{'/'.join(notes) or '无'}]")
+            cover, mime = fetch_cover_deezer(song_artist(song),
+                                             song.get("name", ""))
+            if not cover:
+                cover = make_placeholder_png(seed=song.get("name", "cover"))
+                mime = "png"
+        return True, _finalize(song, data, cover, mime)
     return False, f"没有可外链的免费完整版: {kw}（VIP 原版或试听片段）"
 
 
