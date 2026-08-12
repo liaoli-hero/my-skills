@@ -13,6 +13,9 @@
   python download.py "孤勇者" --dir "D:/Music/点歌器曲库"         # 指定输出目录
   python download.py "成都 赵雷" --count 20                       # 放宽搜索数量
   python download.py "卡农" --no-lyric --no-cover                # 只要音频
+  python download.py --install-deps --pip-index https://pypi.tuna.tsinghua.edu.cn/simple  # 先装依赖
+  python download.py --playlist songs.txt --dir "D:/Music/曲库"   # 歌单批量
+  python -m unittest discover -s tests -v                        # 运行自测
 
 依赖：Python 3.8+，仅需 mutagen（pip install mutagen）
 注意：仅能下载网易云标记为免费（fee=0）且允许外链的歌曲；VIP 原版会失败并自动跳过。
@@ -186,7 +189,8 @@ def make_placeholder_png(size=500, seed="cover"):
         rows += b"\x00" + bytes((r, g, b)) * size
 
     def chunk(tag, data):
-        return (tag + struct.pack(">I", len(data)) + data
+        # PNG 块 = length(4) + type(4) + data + crc(4)
+        return (struct.pack(">I", len(data)) + tag + data
                 + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
 
     return (b"\x89PNG\r\n\x1a\n"
@@ -319,7 +323,7 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose)
 def main():
     ap = argparse.ArgumentParser(
         description="网易云音乐批量下载（免费可外链版，含歌词/封面/ID3）")
-    ap.add_argument("keywords", nargs="+", help="歌曲关键词，支持多首")
+    ap.add_argument("keywords", nargs="*", help="歌曲关键词（与 --playlist 二选一或并用）")
     ap.add_argument("--dir", default=str(Path.home() / "Music"),
                     help="输出目录（默认 ~/Music）")
     ap.add_argument("--count", type=int, default=30,
@@ -329,7 +333,46 @@ def main():
     ap.add_argument("--no-lyric", action="store_true", help="不下载歌词")
     ap.add_argument("--no-cover", action="store_true", help="不写封面/标签")
     ap.add_argument("--verbose", action="store_true", help="显示候选尝试过程")
+    ap.add_argument("--install-deps", action="store_true",
+                    help="先自动安装依赖（pip install mutagen）再下载")
+    ap.add_argument("--pip-index", metavar="URL",
+                    help="pip 镜像源（--install-deps 时使用，"
+                         "国内可填 https://pypi.tuna.tsinghua.edu.cn/simple）")
+    ap.add_argument("--playlist", metavar="FILE",
+                    help="歌单文件路径：每行一首歌，# 开头为注释/空行跳过，"
+                         "与位置参数合并处理")
     args = ap.parse_args()
+
+    if args.install_deps:
+        import subprocess
+        print("[依赖] 正在安装 mutagen…")
+        cmd = [sys.executable, "-m", "pip", "install", "-q", "mutagen"]
+        if args.pip_index:
+            cmd += ["-i", args.pip_index]
+        subprocess.check_call(cmd)
+        try:
+            import mutagen  # noqa: F401
+            print("[依赖] mutagen 安装成功")
+        except ImportError:
+            print("[依赖] 安装失败，请手动执行: pip install mutagen")
+            sys.exit(1)
+
+    keywords = list(args.keywords)
+    if args.playlist:
+        pl_path = Path(args.playlist)
+        if not pl_path.is_file():
+            print(f"✗ 歌单文件不存在: {args.playlist}")
+            sys.exit(1)
+        lines = []
+        for ln in pl_path.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if ln and not ln.startswith("#"):
+                lines.append(ln)
+        print(f"[歌单] 从 {pl_path.name} 读取 {len(lines)} 首")
+        keywords += lines
+    if not keywords:
+        print("✗ 没有要下载的歌（位置参数与 --playlist 均为空）")
+        sys.exit(1)
 
     out_dir = Path(args.dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -339,7 +382,7 @@ def main():
     print("=" * 60)
 
     ok_list, fail_list = [], []
-    for kw in args.keywords:
+    for kw in keywords:
         print(f"▶ {kw}")
         ok, msg = download_one(
             kw, out_dir, min_bytes,

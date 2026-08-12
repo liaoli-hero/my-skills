@@ -1,7 +1,7 @@
 ---
 name: netease-music-downloader
 slug: netease-music-downloader
-version: 1.0.2
+version: 1.0.3
 displayName: 网易云音乐批量下载
 summary: 从网易云音乐批量下载免费可外链歌曲（含同名 LRC 歌词 + 内嵌封面 ID3 标签），供本地播放器/点歌器测试曲库使用。
 description: 从网易云音乐批量下载免费可外链歌曲（含同名 LRC 歌词 + 内嵌封面 ID3 标签），供本地播放器/点歌器测试曲库使用。触发词：下载歌曲、下载音乐、搞几首歌、点歌器测试曲库、音乐下载、点歌、听歌。适用国内网络环境（archive.org/GitHub 直连均不可用时）。
@@ -31,6 +31,16 @@ python scripts/download.py "成都 赵雷" "Canon in D"          # 下载指定�
 python scripts/download.py "孤勇者" --dir "D:/Music/点歌器曲库" # 指定输出目录
 python scripts/download.py "卡农" --no-lyric --no-cover      # 只要音频
 python scripts/download.py "来几首纯音乐" --count 50          # 放宽候选数
+python scripts/download.py --install-deps --pip-index https://pypi.tuna.tsinghua.edu.cn/simple  # 一键装依赖
+python scripts/download.py --playlist songs.txt --dir "D:/Music/曲库"  # 歌单批量下载
+python -m unittest discover -s tests -v                     # 运行离线自测
+```
+
+歌单文件格式：每行一首歌，`#` 开头为注释、空行自动跳过：
+```
+# 我的歌单
+晴天 周杰伦
+光年之外 邓紫棋
 ```
 
 脚本行为：
@@ -75,13 +85,14 @@ python scripts/download.py "来几首纯音乐" --count 50          # 放宽候�
 ## 环境
 - Python 3.8+（Windows 下注意：脚本文件本身放英文路径，避免编码问题）
 - 依赖：仅 `mutagen`（ID3 写入用；未安装时脚本会提示并跳过标签，不影响音频下载）
-- pip 装依赖：`pip install mutagen`（国内可加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`）
-- 脚本内置依赖检查，无需手动配置其他环境
+- 一键安装：`python scripts/download.py --install-deps`（可加 `--pip-index` 指定国内镜像）
+- 离线自测：`python -m unittest discover -s tests -v`（纯标准库，14 个用例覆盖 MP3 头校验/VIP 识别/文件名安全/占位图结构/ID3 mime）
 
 ## 推荐执行方式
 1. **优先直接运行 `scripts/download.py`**——闭环已实现：搜索 → 过滤（精确匹配+时长）→ 试外链（验证 mp3 头）→ 下载 → 歌词 → 封面 → ID3 写入，一次跑完给报告
 2. 需要定制时（如换备用歌单、改过滤规则），改脚本参数或在其基础上扩展
 3. 失败项自动换候选歌（脚本按 fee=0 → 热度排序逐个尝试）
+4. 修改脚本后跑一遍 `tests/` 自测，防止回归（v1.0.3 曾靠自测抓出占位 PNG 块序 bug）
 
 ## FAQ
 
