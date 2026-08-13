@@ -46,6 +46,22 @@ class TestIsMp3(unittest.TestCase):
         self.assertEqual(dl.VIP_ERROR_SIZE, 106884)
 
 
+class TestNormalizeWorkers(unittest.TestCase):
+    """worker 数规范化：非法值一律回落为 1（串行安全模式）。"""
+
+    def test_normal(self):
+        self.assertEqual(dl._normalize_workers(4), 4)
+        self.assertEqual(dl._normalize_workers(1), 1)
+
+    def test_zero_and_negative(self):
+        self.assertEqual(dl._normalize_workers(0), 1)
+        self.assertEqual(dl._normalize_workers(-3), 1)
+
+    def test_bad_type(self):
+        self.assertEqual(dl._normalize_workers("abc"), 1)
+        self.assertEqual(dl._normalize_workers(None), 1)
+
+
 class TestFriendlyNetworkError(unittest.TestCase):
     """网络异常应被转成人话，避免向用户暴露原始栈或 errno。"""
 

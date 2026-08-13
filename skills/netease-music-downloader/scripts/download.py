@@ -15,6 +15,8 @@
   python download.py "卡农" --no-lyric --no-cover                # 只要音频
   python download.py --install-deps --pip-index https://pypi.tuna.tsinghua.edu.cn/simple  # 先装依赖
   python download.py --playlist songs.txt --dir "D:/Music/曲库"   # 歌单批量
+  python download.py --playlist songs.txt --workers 4             # 4 路并行（默认）
+  python download.py "卡农" --workers 1                           # 串行 + 实时进度条
   python -m unittest discover -s tests -v                        # 运行自测
 
 依赖：Python 3.8+，仅需 mutagen（pip install mutagen）
@@ -22,11 +24,13 @@
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -48,6 +52,24 @@ HEADERS = {
 # VIP/版权受限歌曲的外链统一返回这个字节数的 HTML 错误页
 VIP_ERROR_SIZE = 106884
 
+# 并行模式下的输出锁，避免多线程 print 交错
+_PRINT_LOCK = threading.Lock()
+
+
+def _log(*args):
+    """线程安全的打印（并行模式下防交错）。"""
+    with _PRINT_LOCK:
+        print(*args)
+
+
+def _normalize_workers(n):
+    """worker 数规范化：0/负数/非数字一律回落为 1。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return 1
+    return n if n >= 1 else 1
+
 
 def _friendly_network_error(e):
     """把底层网络异常翻译成用户能看懂的话，避免暴露原始栈或 errno。"""
@@ -67,7 +89,7 @@ def _friendly_network_error(e):
     return "网络异常，请稍后重试"
 
 
-def http_get(url, timeout=25, binary=False):
+def http_get(url, timeout=20, binary=False):
     """GET 请求，统一带 UA + Referer，跟随重定向；网络异常转成人话。"""
     req = urllib.request.Request(url, headers=HEADERS)
     try:
@@ -77,7 +99,7 @@ def http_get(url, timeout=25, binary=False):
         raise RuntimeError(_friendly_network_error(e)) from e
 
 
-def http_get_json(url, timeout=25):
+def http_get_json(url, timeout=20):
     return json.loads(http_get(url, timeout).decode("utf-8", "replace"))
 
 
@@ -102,7 +124,7 @@ def search_songs(kw, limit=30):
         data = http_get_json(url)
         return data.get("result", {}).get("songs", []) or []
     except Exception as e:
-        print(f"  [搜索失败] {kw}: {e}")
+        _log(f"  [搜索失败] {kw}: {e}")
         return []
 
 
@@ -182,7 +204,7 @@ def fetch_cover_netease(song_id, album_id, size=500):
             pic = (data.get("album") or {}).get("picUrl") or ""
             if pic:
                 pic += f"?param={size}y{size}"
-                return http_get(pic, timeout=20)
+                return http_get(pic, timeout=10)
     except Exception:
         pass
     return None
@@ -193,11 +215,11 @@ def fetch_cover_deezer(artist, title, size="cover_big"):
     try:
         q = urllib.parse.quote(f'{artist} "{title}"')
         data = http_get_json(
-            f"https://api.deezer.com/search?q={q}&limit=3", timeout=10)
+            f"https://api.deezer.com/search?q={q}&limit=3", timeout=8)
         for r in data.get("data", []) or []:
             url = (r.get("album") or {}).get(size) or ""
             if url:
-                return http_get(url, timeout=15)
+                return http_get(url, timeout=8)
     except Exception:
         pass
     return None
@@ -337,12 +359,11 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose,
     candidates.sort(key=lambda s: -(s.get("score") or 0))
 
     # 优先找「音频+封面」都齐的候选；封面失败不锁定音频，继续换下一个版本
-    best = None  # (song, data) 音频成功但封面未齐的第一个候选，作兜底
+    best = None  # (song, data, lrc) 音频成功但封面未齐的第一个候选，作兜底
     network_reasons = set()
 
-    def _finalize(song, data, cover, cover_mime):
-        """写文件 + 歌词 + ID3，返回汇报消息。"""
-        sid = song["id"]
+    def _finalize(song, data, cover, cover_mime, lrc):
+        """写文件 + 歌词 + ID3，返回汇报消息。lrc 为并发预取结果（可 None）。"""
         name = song.get("name", "")
         artist = song_artist(song)
         dur = song.get("duration", 0) / 1000
@@ -357,7 +378,6 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose,
 
         notes = []
         if with_lyric:
-            lrc = fetch_lyric(sid)
             if lrc:
                 (Path(out_dir) / f"{fname}.lrc").write_text(lrc, encoding="utf-8")
                 notes.append("歌词")
@@ -384,20 +404,31 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose,
         dur = song.get("duration", 0) / 1000
 
         if verbose:
-            print(f"  试 {name} - {artist} ({dur:.0f}s, fee={song.get('fee')})")
+            _log(f"  试 {name} - {artist} ({dur:.0f}s, fee={song.get('fee')})")
 
         # 幂等：目标文件已存在且是有效完整 mp3 → 跳过下载，只补缺失的歌词/封面
         fname = sanitize(f"{artist or '未知艺术家'} - {name or '未知歌曲'}")
         mp3_path = Path(out_dir) / f"{fname}.mp3"
         if is_valid_mp3_file(mp3_path, min_bytes):
             if verbose:
-                print(f"  = 已存在，补全缺失项…")
+                _log("  = 已存在，补全缺失项…")
             notes = _enrich_existing(mp3_path, song, out_dir,
                                      with_lyric, with_cover)
             return True, (f"{name} - {artist}  已存在"
                           + (f"（{'、'.join(notes)}）" if notes else "，无缺失"))
 
-        data, ok, reason = try_download(sid, min_bytes, progress=progress)
+        # 单首内部并发：音频下载（长任务）与歌词/封面同时拉取，互不等待
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f_audio = pool.submit(try_download, sid, min_bytes,
+                                  progress=progress)
+            f_lyric = (pool.submit(fetch_lyric, sid) if with_lyric else None)
+            f_cover = (pool.submit(
+                fetch_cover, sid, (song.get("album") or {}).get("id"),
+                artist, name) if with_cover else None)
+            data, ok, reason = f_audio.result()
+            lrc = f_lyric.result() if f_lyric else None
+            cover, mime = f_cover.result() if f_cover else (None, None)
+
         if not ok:
             if reason and ("网络" in reason or "超时" in reason
                            or "DNS" in reason or "服务器" in reason):
@@ -405,22 +436,19 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose,
             continue
 
         if best is None:
-            best = (song, data)
+            best = (song, data, lrc)
 
         if not with_cover:
-            return True, _finalize(song, data, None, None)
-
-        cover, mime = fetch_cover(sid, (song.get("album") or {}).get("id"),
-                                  artist, name)
+            return True, _finalize(song, data, None, None, lrc)
         if cover:
-            return True, _finalize(song, data, cover, mime)
+            return True, _finalize(song, data, cover, mime, lrc)
         # 封面失败 → 换下一个候选版本（可能专辑带图）
         if verbose:
-            print(f"  - {name} 无封面，继续换候选…")
+            _log(f"  - {name} 无封面，继续换候选…")
 
     # 所有候选都没有封面：用第一首音频成功的，走 Deezer 备源 + 占位图兜底
     if best:
-        song, data = best
+        song, data, lrc = best
         cover = mime = None
         if with_cover:
             cover, mime = fetch_cover_deezer(song_artist(song),
@@ -428,7 +456,7 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose,
             if not cover:
                 cover = make_placeholder_png(seed=song.get("name", "cover"))
                 mime = "png"
-        return True, _finalize(song, data, cover, mime)
+        return True, _finalize(song, data, cover, mime, lrc)
 
     if network_reasons:
         hint = next(iter(network_reasons))
@@ -470,6 +498,9 @@ def main():
     ap.add_argument("--playlist", metavar="FILE",
                     help="歌单文件路径：每行一首歌，# 开头为注释/空行跳过，"
                          "与位置参数合并处理")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="并行下载数（默认 4，越大越快但更易触发限流；"
+                         "设为 1 为串行并显示实时进度条）")
     args = ap.parse_args()
 
     if args.install_deps:
@@ -504,26 +535,34 @@ def main():
     min_bytes = int(args.min_mb * 1048576)
 
     print(f"输出目录: {out_dir}")
+    workers = _normalize_workers(args.workers)
+    if workers > 1:
+        print(f"并行下载: {workers} 个任务同时进行（限流时用 --workers 1 降速）")
     print("=" * 60)
 
     ok_list, fail_list = [], []
-    for kw in keywords:
-        print(f"▶ {kw}")
-        ok, msg = download_one(
-            kw, out_dir, min_bytes,
-            with_lyric=not args.no_lyric,
-            with_cover=not args.no_cover,
-            limit=args.count,
-            verbose=args.verbose,
-            progress=True,
-        )
-        if ok:
-            print(f"  ✓ {msg}")
-            ok_list.append(msg)
-        else:
-            print(f"  ✗ {msg}")
-            fail_list.append(msg)
-        time.sleep(0.5)  # 礼貌限速
+    task_map = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for kw in keywords:
+            # 并行模式禁用实时进度条（多线程会互相覆盖），只保留每首结果行
+            task_map[pool.submit(
+                download_one, kw, out_dir, min_bytes,
+                with_lyric=not args.no_lyric,
+                with_cover=not args.no_cover,
+                limit=args.count,
+                verbose=args.verbose,
+                progress=(workers == 1),
+            )] = kw
+            time.sleep(0.3)  # 礼貌限速：错开提交峰值
+        for fut in concurrent.futures.as_completed(task_map):
+            kw = task_map[fut]
+            ok, msg = fut.result()
+            if ok:
+                _log(f"  ✓ {msg}")
+                ok_list.append(msg)
+            else:
+                _log(f"  ✗ {msg}")
+                fail_list.append(msg)
 
     print("=" * 60)
     print(f"完成：成功 {len(ok_list)} 首，失败 {len(fail_list)} 项")
