@@ -25,8 +25,10 @@ import argparse
 import json
 import os
 import re
+import socket
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -47,11 +49,32 @@ HEADERS = {
 VIP_ERROR_SIZE = 106884
 
 
+def _friendly_network_error(e):
+    """把底层网络异常翻译成用户能看懂的话，避免暴露原始栈或 errno。"""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"服务器返回错误码 {e.code}，可能是接口临时调整，请稍后重试"
+    if isinstance(e, urllib.error.URLError):
+        reason = getattr(e.reason, "strerror", None) or str(e.reason)
+        lowered = reason.lower()
+        if "timed out" in lowered or isinstance(
+                e.reason, (socket.timeout, TimeoutError)):
+            return "连接超时，网络抖动时请稍后重试"
+        if "name or service not known" in lowered or "getaddrinfo" in lowered:
+            return "DNS 解析失败，请检查网络连接"
+        return f"网络连接异常：{reason}"
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return "连接超时，请稍后重试"
+    return "网络异常，请稍后重试"
+
+
 def http_get(url, timeout=25, binary=False):
-    """GET 请求，统一带 UA + Referer，跟随重定向。"""
+    """GET 请求，统一带 UA + Referer，跟随重定向；网络异常转成人话。"""
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception as e:
+        raise RuntimeError(_friendly_network_error(e)) from e
 
 
 def http_get_json(url, timeout=25):
@@ -101,7 +124,7 @@ def _show_progress(done, total):
 
 
 def try_download(song_id, min_bytes=2 * 1024 * 1024, progress=False):
-    """尝试下载歌曲，返回 (音频字节, 是否完整) 或 (None, False)。"""
+    """尝试下载歌曲，返回 (音频字节, 是否完整, 失败原因)。成功时原因为 None。"""
     url = f"{URL_OUTER}?id={song_id}.mp3"
     try:
         req = urllib.request.Request(url, headers=HEADERS)
@@ -118,14 +141,14 @@ def try_download(song_id, min_bytes=2 * 1024 * 1024, progress=False):
             if progress and sys.stderr.isatty():
                 sys.stderr.write("\r" + " " * 60 + "\r")
                 sys.stderr.flush()
-    except Exception:
-        return None, False
+    except Exception as e:
+        return None, False, _friendly_network_error(e)
     if not is_mp3(bytes(data)):
-        return None, False
+        return None, False, "返回的不是有效 MP3（可能是 VIP/版权受限）"
     # VIP 错误页也是 HTML，头部校验已拦截；再按大小兜底试听片段
     if len(data) < min_bytes:
-        return None, False
-    return bytes(data), True
+        return None, False, "文件太小，可能是试听片段"
+    return bytes(data), True, None
 
 
 def is_valid_mp3_file(path, min_bytes=2 * 1024 * 1024):
@@ -315,6 +338,7 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose,
 
     # 优先找「音频+封面」都齐的候选；封面失败不锁定音频，继续换下一个版本
     best = None  # (song, data) 音频成功但封面未齐的第一个候选，作兜底
+    network_reasons = set()
 
     def _finalize(song, data, cover, cover_mime):
         """写文件 + 歌词 + ID3，返回汇报消息。"""
@@ -373,8 +397,11 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose,
             return True, (f"{name} - {artist}  已存在"
                           + (f"（{'、'.join(notes)}）" if notes else "，无缺失"))
 
-        data, ok = try_download(sid, min_bytes, progress=progress)
+        data, ok, reason = try_download(sid, min_bytes, progress=progress)
         if not ok:
+            if reason and ("网络" in reason or "超时" in reason
+                           or "DNS" in reason or "服务器" in reason):
+                network_reasons.add(reason)
             continue
 
         if best is None:
@@ -402,6 +429,10 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose,
                 cover = make_placeholder_png(seed=song.get("name", "cover"))
                 mime = "png"
         return True, _finalize(song, data, cover, mime)
+
+    if network_reasons:
+        hint = next(iter(network_reasons))
+        return False, f"网络异常，{kw} 未能下载（{hint}）"
     return False, f"没有可外链的免费完整版: {kw}（VIP 原版或试听片段）"
 
 

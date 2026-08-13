@@ -10,10 +10,12 @@ netease-music-downloader 离线自测（纯标准库，无需网络与第三方�
 
 import io
 import os
+import socket
 import struct
 import sys
 import tempfile
 import unittest
+import urllib.error
 import zlib
 from pathlib import Path
 
@@ -42,6 +44,32 @@ class TestIsMp3(unittest.TestCase):
     def test_vip_error_size_constant(self):
         """VIP 错误页特征字节数常量保持 106884（文档与代码一致）。"""
         self.assertEqual(dl.VIP_ERROR_SIZE, 106884)
+
+
+class TestFriendlyNetworkError(unittest.TestCase):
+    """网络异常应被转成人话，避免向用户暴露原始栈或 errno。"""
+
+    def test_http_error(self):
+        e = urllib.error.HTTPError(
+            "https://music.163.com/", 503, "Service Unavailable", {}, None)
+        msg = dl._friendly_network_error(e)
+        self.assertIn("服务器", msg)
+        self.assertIn("503", msg)
+
+    def test_url_error_timeout(self):
+        e = urllib.error.URLError(socket.timeout("timed out"))
+        msg = dl._friendly_network_error(e)
+        self.assertIn("超时", msg)
+
+    def test_socket_timeout(self):
+        msg = dl._friendly_network_error(socket.timeout("timed out"))
+        self.assertIn("超时", msg)
+
+    def test_no_raw_errno(self):
+        """提示语中不应出现 [Errno X] 这类原始错误号。"""
+        e = urllib.error.URLError(OSError(11001, "getaddrinfo failed"))
+        msg = dl._friendly_network_error(e)
+        self.assertNotIn("Errno", msg)
 
 
 class TestSanitize(unittest.TestCase):
