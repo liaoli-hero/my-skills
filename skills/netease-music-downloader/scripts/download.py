@@ -87,19 +87,57 @@ def song_artist(song):
     return (song.get("artists") or [{}])[0].get("name", "")
 
 
-def try_download(song_id, min_bytes=2 * 1024 * 1024):
+def _show_progress(done, total):
+    """下载进度条：仅终端输出（\r 覆盖），避免污染重定向日志。"""
+    if total > 0:
+        pct = min(done * 100 // total, 100)
+        bar_len = 20
+        filled = pct * bar_len // 100
+        bar = "█" * filled + "─" * (bar_len - filled)
+        sys.stderr.write(f"\r  下载 {bar} {pct:3d}%  ({done // 1024}KB/{total // 1024}KB)")
+    else:
+        sys.stderr.write(f"\r  下载 {done // 1024}KB…")
+    sys.stderr.flush()
+
+
+def try_download(song_id, min_bytes=2 * 1024 * 1024, progress=False):
     """尝试下载歌曲，返回 (音频字节, 是否完整) 或 (None, False)。"""
     url = f"{URL_OUTER}?id={song_id}.mp3"
     try:
-        data = http_get(url, timeout=40)
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            data = bytearray()
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                data += chunk
+                if progress and sys.stderr.isatty():
+                    _show_progress(len(data), total)
+            if progress and sys.stderr.isatty():
+                sys.stderr.write("\r" + " " * 60 + "\r")
+                sys.stderr.flush()
     except Exception:
         return None, False
-    if not is_mp3(data):
+    if not is_mp3(bytes(data)):
         return None, False
     # VIP 错误页也是 HTML，头部校验已拦截；再按大小兜底试听片段
     if len(data) < min_bytes:
         return None, False
-    return data, True
+    return bytes(data), True
+
+
+def is_valid_mp3_file(path, min_bytes=2 * 1024 * 1024):
+    """轻量判定已存在文件是否为有效完整 mp3（只读文件头，不读全文）。"""
+    try:
+        if not path.is_file() or os.path.getsize(path) < min_bytes:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(3)
+        return head[:3] == b"ID3" or (head[0] == 0xFF and (head[1] & 0xE0) == 0xE0)
+    except Exception:
+        return False
 
 
 def fetch_lyric(song_id):
@@ -227,7 +265,43 @@ def write_id3(mp3_path, title, artist, album, cover_bytes, cover_mime="jpeg"):
     return True
 
 
-def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose):
+def _enrich_existing(mp3_path, song, out_dir, with_lyric, with_cover):
+    """已存在文件的补全：缺歌词补歌词、缺封面/标签补写 ID3。返回补全说明列表。"""
+    name = song.get("name", "")
+    artist = song_artist(song)
+    album = (song.get("album") or {}).get("name", "")
+    fname = mp3_path.stem
+    notes = []
+
+    lrc_path = Path(out_dir) / f"{fname}.lrc"
+    if with_lyric and not lrc_path.is_file():
+        lrc = fetch_lyric(song["id"])
+        if lrc:
+            lrc_path.write_text(lrc, encoding="utf-8")
+            notes.append("补歌词")
+
+    if with_cover:
+        has_apic = False
+        try:
+            from mutagen.id3 import ID3
+            has_apic = bool(ID3(str(mp3_path)).getall("APIC"))
+        except Exception:
+            pass
+        if not has_apic:
+            cover, mime = fetch_cover(
+                song["id"], (song.get("album") or {}).get("id"), artist, name)
+            if not cover:
+                cover, mime = fetch_cover_deezer(artist, name)
+            if not cover:
+                cover = make_placeholder_png(seed=name or "cover")
+                mime = "png"
+            write_id3(mp3_path, name, artist, album, cover, mime)
+            notes.append("补封面" if mime != "png" else "补占位封面")
+    return notes
+
+
+def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose,
+                 progress=False):
     """下载单个关键词对应的歌曲。返回 (ok, msg)。"""
     songs = search_songs(kw, limit)
     if not songs:
@@ -288,7 +362,18 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose)
         if verbose:
             print(f"  试 {name} - {artist} ({dur:.0f}s, fee={song.get('fee')})")
 
-        data, ok = try_download(sid, min_bytes)
+        # 幂等：目标文件已存在且是有效完整 mp3 → 跳过下载，只补缺失的歌词/封面
+        fname = sanitize(f"{artist or '未知艺术家'} - {name or '未知歌曲'}")
+        mp3_path = Path(out_dir) / f"{fname}.mp3"
+        if is_valid_mp3_file(mp3_path, min_bytes):
+            if verbose:
+                print(f"  = 已存在，补全缺失项…")
+            notes = _enrich_existing(mp3_path, song, out_dir,
+                                     with_lyric, with_cover)
+            return True, (f"{name} - {artist}  已存在"
+                          + (f"（{'、'.join(notes)}）" if notes else "，无缺失"))
+
+        data, ok = try_download(sid, min_bytes, progress=progress)
         if not ok:
             continue
 
@@ -318,6 +403,19 @@ def download_one(kw, out_dir, min_bytes, with_lyric, with_cover, limit, verbose)
                 mime = "png"
         return True, _finalize(song, data, cover, mime)
     return False, f"没有可外链的免费完整版: {kw}（VIP 原版或试听片段）"
+
+
+def parse_playlist(path):
+    """解析歌单文件：每行一首，# 开头为注释、空行跳过。返回关键词列表。"""
+    pl_path = Path(path)
+    if not pl_path.is_file():
+        raise FileNotFoundError(f"歌单文件不存在: {path}")
+    lines = []
+    for ln in pl_path.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith("#"):
+            lines.append(ln)
+    return lines
 
 
 def main():
@@ -359,16 +457,12 @@ def main():
 
     keywords = list(args.keywords)
     if args.playlist:
-        pl_path = Path(args.playlist)
-        if not pl_path.is_file():
-            print(f"✗ 歌单文件不存在: {args.playlist}")
+        try:
+            lines = parse_playlist(args.playlist)
+        except FileNotFoundError as e:
+            print(f"✗ {e}")
             sys.exit(1)
-        lines = []
-        for ln in pl_path.read_text(encoding="utf-8").splitlines():
-            ln = ln.strip()
-            if ln and not ln.startswith("#"):
-                lines.append(ln)
-        print(f"[歌单] 从 {pl_path.name} 读取 {len(lines)} 首")
+        print(f"[歌单] 从 {Path(args.playlist).name} 读取 {len(lines)} 首")
         keywords += lines
     if not keywords:
         print("✗ 没有要下载的歌（位置参数与 --playlist 均为空）")
@@ -390,6 +484,7 @@ def main():
             with_cover=not args.no_cover,
             limit=args.count,
             verbose=args.verbose,
+            progress=True,
         )
         if ok:
             print(f"  ✓ {msg}")

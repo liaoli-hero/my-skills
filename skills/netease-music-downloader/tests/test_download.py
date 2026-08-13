@@ -12,8 +12,10 @@ import io
 import os
 import struct
 import sys
+import tempfile
 import unittest
 import zlib
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import download as dl  # noqa: E402
@@ -122,6 +124,87 @@ class TestWriteId3Mime(unittest.TestCase):
                          dl.make_placeholder_png(seed="x"), "png")
             t = ID3(mp3)
             self.assertEqual(t.getall("APIC")[0].mime, "image/png")
+
+
+class TestPlaylistParsing(unittest.TestCase):
+    def test_parse_basic(self):
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write("# 我的歌单\n晴天 周杰伦\n\n光年之外 邓紫棋\n")
+            path = f.name
+        try:
+            self.assertEqual(dl.parse_playlist(path),
+                             ["晴天 周杰伦", "光年之外 邓紫棋"])
+        finally:
+            os.unlink(path)
+
+    def test_parse_missing_file(self):
+        with self.assertRaises(FileNotFoundError):
+            dl.parse_playlist("/nonexistent/songs.txt")
+
+    def test_parse_only_comments(self):
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write("# 全是注释\n\n")
+            path = f.name
+        try:
+            self.assertEqual(dl.parse_playlist(path), [])
+        finally:
+            os.unlink(path)
+
+
+class TestProgressFormat(unittest.TestCase):
+    def test_percent_capped(self):
+        """进度条百分比不超过 100。"""
+        out = io.StringIO()
+        old = sys.stderr
+        sys.stderr = out
+        try:
+            dl._show_progress(50, 100)
+            dl._show_progress(100, 100)
+        finally:
+            sys.stderr = old
+        text = out.getvalue()
+        self.assertIn("100%", text)
+        self.assertNotIn("101%", text)
+        self.assertIn("下载", text)
+
+    def test_no_total_branch(self):
+        out = io.StringIO()
+        old = sys.stderr
+        sys.stderr = out
+        try:
+            dl._show_progress(2048, 0)  # 未知总量走 KB 计数
+        finally:
+            sys.stderr = old
+        self.assertIn("KB", out.getvalue())
+
+
+class TestValidMp3File(unittest.TestCase):
+    def test_valid_id3_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "a.mp3")
+            with open(p, "wb") as f:
+                f.write(b"ID3\x04\x00\x00" + b"\x00" * 30)
+            # 头是 ID3 但文件太小（<min_bytes）→ 判为无效（试听片段）
+            self.assertFalse(dl.is_valid_mp3_file(Path(p), min_bytes=1000))
+
+    def test_valid_mpeg_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "b.mp3")
+            with open(p, "wb") as f:
+                f.write(b"\xff\xfb" + b"\x00" * 3000)
+            self.assertTrue(dl.is_valid_mp3_file(Path(p), min_bytes=1000))
+
+    def test_invalid_text_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "fake.mp3")
+            with open(p, "wb") as f:
+                f.write(b"<html>" + b"x" * 3000)
+            self.assertFalse(dl.is_valid_mp3_file(Path(p), min_bytes=1000))
+
+    def test_missing_file(self):
+        self.assertFalse(dl.is_valid_mp3_file(Path("/no/such.mp3")))
 
 
 if __name__ == "__main__":
